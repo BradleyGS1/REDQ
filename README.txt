@@ -1,0 +1,1 @@
+Implementation of Randomised Ensemble Double Q-function (REDQ) algorithm with Soft Actor-Critic (SAC) base.
