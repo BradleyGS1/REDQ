@@ -216,7 +216,7 @@ class AgentREDQ:
         # Concatenate list of Q values from each submodel head in ensemble along last dimension then
         # gather the elements using a subset of values calculated by each head for each element in batch
         # Shape: (None, self.ensemble_size) -> (None, num_q_evals)
-        q_indices = tf.random.categorical(tf.ones(shape=q_values.shape, dtype=tf.float32), num_samples=num_q_evals, dtype=tf.int32)
+        q_indices = tf.random.categorical(tf.zeros(shape=q_values.shape, dtype=tf.float32), num_samples=num_q_evals, dtype=tf.int32)
         q_values_subset = tf.gather(q_values, q_indices, axis=-1, batch_dims=True)
 
         # Get the minimum Q values from the randomly chosen subset of Q functions in the ensemble
@@ -232,7 +232,9 @@ class AgentREDQ:
         self.td_targets_std_instance._tf_update(td_targets_std)
 
         # Repeat td targets along -1 axis because we want them to be the same for each network in ensemble
-        return tf.repeat(tf.expand_dims(td_targets, axis=-1), repeats=self.ensemble_size, axis=-1)
+        td_targets = tf.repeat(tf.expand_dims(td_targets, axis=-1), repeats=self.ensemble_size, axis=-1)
+
+        return td_targets
     
 
     # Function to compute a single critic network loss
@@ -249,7 +251,10 @@ class AgentREDQ:
         # Shape: (None, )
         critic_loss = mean_squared_error(y_true=td_targets, y_pred=q_values)
 
-        return tf.math.reduce_mean(critic_loss)
+        # Shape: ()
+        critic_loss = tf.math.reduce_mean(critic_loss)
+
+        return critic_loss
     
 
     # Function to compute policy network loss
@@ -371,19 +376,26 @@ class AgentREDQ:
         t4 = time()
 
         # Perform policy update
-        policy_loss = self._policy_update(
-            policy_optimizer,
-            states,
-            entropy_reg
-        )
+        if self.step % int(self.train_steps_per_env_step // 1) == 0:
+            policy_loss = self._policy_update(
+                policy_optimizer,
+                states,
+                entropy_reg
+            )
 
-        t5 = time()
+        else:
+            policy_loss = self.policy_loss
+
+        self.step += 1
+
+        """
         print(t1-t0)
         print(t2-t1)
         print(t3-t2)
         print(t4-t3)
         print(t5-t4)
         print()
+        """
 
         return critic_loss, policy_loss
 
@@ -393,11 +405,11 @@ class AgentREDQ:
             self,
             steps_per_epoch: int = 1000,
             epochs: int = 50,
-            update_after: int = 5000,
-            start_steps: int = 0,
+            update_after: int = 2000,
+            start_steps: int = 1000,
             train_steps_per_env_step: int = 20,
-            ensemble_size: int = 5,
-            num_q_evals: int = 2,
+            ensemble_size: int = 10,
+            num_q_evals: int = 3,
             eval_episodes: int = 1,
             batch_size: int = 256,
             replay_size: int = 10 ** 6,
@@ -540,7 +552,7 @@ class AgentREDQ:
                 save_model(self.policy_network, filepath=f"{log_dir}/agent/policy_network", include_optimizer=False)
                 save_model(self.critic_network, filepath=f"{log_dir}/agent/critic_network", include_optimizer=False)
             else:
-                print(f"mean_return={new_return}  -  no improvement")
+                print(f"mean_return={new_return}  -  no improvement\n")
 
         # !!! END OF TRAINING !!!
 
