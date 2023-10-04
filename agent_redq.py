@@ -4,14 +4,16 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 import gymnasium as gym
 
+from threading import Thread
 from time import time, sleep
 from tqdm import trange
-from keras.models import Model, clone_model, save_model
+from keras.layers import Input
 from keras.losses import mean_squared_error
+from keras.models import Model, _clone_layer, clone_model, save_model
 from keras.optimizers import Adam
 
 from replay_buffer import ReplayBuffer
-from running_average import RunningAverageMetric, RunningAverageReturn
+from running_average import RunningAverage
 
 # Create Single Agent Randomised Ensemble Double Q-learning
 
@@ -28,36 +30,28 @@ class AgentREDQ:
         self.env = env
         self._init_environment()
 
-        # Initialise the running averages for episodic mean return and std of temporal difference targets
-        self.td_targets_std_instance = RunningAverageMetric(sample_size=100, non_zero=True)
-        self.mean_return_instance = RunningAverageReturn(sample_size=3)
+        # Initialise the running averages
+        self.td_targets_std_instance = RunningAverage(sample_size=100, non_zero=True)
+        self.critic_loss_instance = RunningAverage(sample_size=100)
+        self.policy_loss_instance = RunningAverage(sample_size=100)
+        self.mean_return_instance = RunningAverage(sample_size=3)
 
 
     # Function to create Q function ensemble network
 
     def _init_ensemble(self, q_network: tf.keras.models.Model, ensemble_size: int):
-        state_input = q_network.layers[0].input
-        action_input = q_network.layers[1].input
+        state_input = Input(q_network.layers[0].input_shape[0][1])
+        action_input = Input(q_network.layers[1].input_shape[0][1])
 
-        inputs = q_network.layers[2]([state_input, action_input])
+        join = _clone_layer(q_network.layers[2])([state_input, action_input])
 
-        class SubmodelLayer(tf.keras.layers.Layer):
-            def __init__(self, **kwargs):
-                super(SubmodelLayer, self).__init__(**kwargs)
+        backbone_layers = [clone_model(Model(inputs=q_network.layers[3].input, outputs=q_network.layers[-1].output)) for _ in range(ensemble_size)]
 
-            def build(self, input_shape):
-                self.backbone = clone_model(Model(inputs=q_network.layers[3].input, outputs=q_network.layers[-1].output))
-                super(SubmodelLayer, self).build(input_shape)
+        backbone_layers = [backbone_layer(join) for backbone_layer in backbone_layers]
 
-            def call(self, inputs):
-                return self.backbone(inputs)
-            
-        # Create a list to hold the outputs of each submodel
-        backbone_outputs = [SubmodelLayer()(inputs) for _ in range(ensemble_size)]
+        ensemble_network = Model(inputs=[state_input, action_input], outputs=backbone_layers)
 
-        critic_network = Model(inputs=[state_input, action_input], outputs=backbone_outputs)
-
-        return critic_network
+        return ensemble_network
 
 
     # Function to reset the environment and get the initial state
@@ -111,12 +105,12 @@ class AgentREDQ:
 
     # Function to sample an action from the policy network
 
-    def _sample_action(self, states: tf.Tensor):
-        outputs = self.policy_network(states)
+    def _sample_action(self, policy_network: tf.keras.models.Model, states: tf.Tensor):
+        outputs = policy_network(states)
         
         # Get the mean and stddev vector from policy network
         means = outputs[0]
-        stddevs = outputs[1] + tf.constant(1e-6)
+        stddevs = outputs[1] + tf.constant(1e-8)
 
         # Get the approximated multivariate normal policy distribution 
         policy_distribution = tfp.distributions.MultivariateNormalDiag(
@@ -124,7 +118,7 @@ class AgentREDQ:
             scale_diag=stddevs
         )
 
-        # We sample the actions values from the multivariate normal dist and get the log likelihoods
+        # We sample the actions values from the multivariate normal dist and get the log probs
         sample_values = policy_distribution.sample(seed=42)
         log_probs = policy_distribution.log_prob(sample_values)
 
@@ -135,24 +129,24 @@ class AgentREDQ:
         action_log_probs = (
             log_probs
             -
-            tf.math.reduce_sum(tf.math.log(1 + 1e-6 - action_values**2), axis=-1)
+            tf.math.reduce_sum(tf.math.log(1 + 1e-8 - action_values**2), axis=-1)
         )
 
         # action_values, shape: (None, action_dim)
-        # action_log_ls, shape: (None, )
+        # action_log_probs, shape: (None, )
         return action_values, action_log_probs
 
 
     # Function to get a during training environment transition (action sampled using policy network) and add to the agents replay buffer
 
-    def _train_env_step(self, total_steps: int, start_steps: int):
+    def _train_env_step(self, policy_network: tf.keras.models.Model, env_steps: int, start_steps: int):
         # Sample action using agents policy network, update environment and add transition to replay buffer
         # Note: for an initial number of start_steps environment steps we sample from the action space uniformly at random
-        if total_steps < start_steps:
+        if env_steps < start_steps:
             action = tf.convert_to_tensor(self.env.action_space.sample(), dtype=tf.float32)
             action = tf.expand_dims(action, axis=0)
         else:
-            action, _ = self._sample_action(self.state)
+            action, _ = self._sample_action(policy_network, self.state)
 
         new_state, reward, done = self.tf_env_step(action)
 
@@ -195,9 +189,10 @@ class AgentREDQ:
 
     # Function to calculate temporal difference targets and record the mean and std in running average instances
 
-    @tf.function
     def _compute_targets(
             self,
+            policy_network: tf.keras.models.Model,
+            target_network: tf.keras.models.Model,
             rewards: tf.Tensor, 
             new_states: tf.Tensor, 
             done_flags: tf.Tensor, 
@@ -207,15 +202,15 @@ class AgentREDQ:
         
         # Sample new action and get action prob
         # Shapes are: (None, action_dim), (None, )
-        new_actions, new_action_log_probs = self._sample_action(new_states)
+        new_actions, new_action_log_probs = self._sample_action(policy_network, new_states)
 
         # Get the tensor of Q values from the target network ensemble
-        # Shape: (None, self.ensemble_size)
-        q_values = tf.concat(self.target_network([new_states, new_actions]), axis=-1)
+        # Shape: (None, ensemble_size)
+        q_values = tf.concat(target_network([new_states, new_actions]), axis=-1)
 
         # Concatenate list of Q values from each submodel head in ensemble along last dimension then
         # gather the elements using a subset of values calculated by each head for each element in batch
-        # Shape: (None, self.ensemble_size) -> (None, num_q_evals)
+        # Shape: (None, ensemble_size) -> (None, num_q_evals)
         q_indices = tf.random.categorical(tf.zeros(shape=q_values.shape, dtype=tf.float32), num_samples=num_q_evals, dtype=tf.int32)
         q_values_subset = tf.gather(q_values, q_indices, axis=-1, batch_dims=True)
 
@@ -225,14 +220,8 @@ class AgentREDQ:
         # Calculate temporal difference targets
         td_targets = rewards + discount_factor * (1 - done_flags) * (min_q_values - entropy_reg * new_action_log_probs)
 
-        # Compute the standard deviation of this batch of targets
-        td_targets_std = tf.math.reduce_std(td_targets)
-
-        # Update the td targets std running average instance
-        self.td_targets_std_instance._tf_update(td_targets_std)
-
         # Repeat td targets along -1 axis because we want them to be the same for each network in ensemble
-        td_targets = tf.repeat(tf.expand_dims(td_targets, axis=-1), repeats=self.ensemble_size, axis=-1)
+        td_targets = tf.repeat(tf.expand_dims(td_targets, axis=-1), repeats=q_values.shape[-1], axis=-1)
 
         return td_targets
     
@@ -241,18 +230,15 @@ class AgentREDQ:
 
     def _compute_critic_loss(
             self,
+            critic_network: tf.keras.models.Model,
             states: tf.Tensor, 
             actions: tf.Tensor, 
             td_targets: tf.Tensor):
         
-        # Shape: (None, self.ensemble_size)
-        q_values = tf.concat(self.critic_network([states, actions]), axis=-1)
-        
-        # Shape: (None, )
-        critic_loss = mean_squared_error(y_true=td_targets, y_pred=q_values)
+        # Shape: (None, ensemble_size)
+        q_values = tf.concat(critic_network([states, actions]), axis=-1)
 
-        # Shape: ()
-        critic_loss = tf.math.reduce_mean(critic_loss)
+        critic_loss = tf.math.reduce_mean(tf.math.reduce_sum((q_values - td_targets) ** 2, axis=-1))
 
         return critic_loss
     
@@ -261,14 +247,16 @@ class AgentREDQ:
 
     def _compute_policy_loss(
             self,
+            policy_network: tf.keras.models.Model,
+            critic_network: tf.keras.models.Model,
             states: tf.Tensor,
             entropy_reg: float):
         
         # Sample actions and action_probs from policy 
         # Note: sampling is differentiable thanks to the reparameterisation trick
-        actions, action_log_probs = self._sample_action(states)
+        actions, action_log_probs = self._sample_action(policy_network, states)
 
-        q_values = tf.concat(self.critic_network([states, actions]), axis=-1)
+        q_values = tf.concat(critic_network([states, actions]), axis=-1)
 
         # Get the mean Q values along the ensemble of Q functions to get a better approximator
         mean_q_values = tf.math.reduce_mean(q_values, axis=-1)
@@ -282,74 +270,38 @@ class AgentREDQ:
 
     # Function to update target Q network using Polyak interpolation
 
-    def _update_target_network(self, polyak: float):
-
-        critic_network_weights = self.critic_network.get_weights()
-        target_network_weights = self.target_network.get_weights()
-
-        target_network_new_weights = []
-
-        for i in range(len(critic_network_weights)):
-            target_network_new_weights.append(polyak * target_network_weights[i] + (1 - polyak) * critic_network_weights[i])
-
-        self.target_network.set_weights(target_network_new_weights)
-
-
-    # Function to perform a single critic network update
-    @tf.function
-    def _critic_update(
-        self,
-        optimizer: tf.keras.optimizers.Optimizer,
-        states: tf.Tensor,
-        actions: tf.Tensor,
-        td_targets: tf.Tensor):
-
-        with tf.GradientTape() as tape:
-            critic_loss = self._compute_critic_loss(states, actions, td_targets)
-
-        critic_grads = tape.gradient(critic_loss, self.critic_network.trainable_variables)
-        optimizer.apply_gradients(zip(critic_grads, self.critic_network.trainable_variables))
-
-        return critic_loss
+    def _update_target_network(self, target_network: tf.keras.models.Model, critic_network: tf.keras.models.Model, polyak: float):
     
+        for target_var, source_var in zip(target_network.trainable_variables, critic_network.trainable_variables):
+            target_var.assign(polyak * target_var + (1 - polyak) * source_var)
 
-    # Function to perform a single policy update
-    @tf.function
-    def _policy_update(
-            self,
-            optimizer: tf.keras.optimizers.Optimizer,
-            states: tf.Tensor,
-            entropy_reg: float):
-
-        with tf.GradientTape() as tape:
-            policy_loss = self._compute_policy_loss(states, entropy_reg)
-
-        policy_grads = tape.gradient(policy_loss, self.policy_network.trainable_variables)
-        optimizer.apply_gradients(zip(policy_grads, self.policy_network.trainable_variables))
-
-        return policy_loss
 
     # Function to perform a single training step of the agent
 
+    @tf.function
     def _training_step(            
             self,
-            batch_size: int,
-            critic_optimizer: tf.keras.optimizers.Optimizer,
+            update_policy: bool,
+            policy_network: tf.keras.models.Model,
+            critic_network: tf.keras.models.Model,
+            target_network: tf.keras.models.Model,
             policy_optimizer: tf.keras.optimizers.Optimizer,
+            critic_optimizer: tf.keras.optimizers.Optimizer,
+            states: tf.Tensor,
+            actions: tf.Tensor,
+            rewards: tf.Tensor,
+            new_states: tf.Tensor,
+            done_flags: tf.Tensor,
             discount_factor: float,
             entropy_reg: float,
             polyak: float,
             num_q_evals: int):
         
-        t0 = time()
-        
-        # Gets transition tensors from replay buffer sample
-        states, actions, rewards, new_states, done_flags = self.replay_buffer._sample(batch_size)
-
-        t1 = time()
 
         # Get temporal difference targets
         td_targets = self._compute_targets(
+            policy_network,
+            target_network,
             rewards,
             new_states,
             done_flags,
@@ -358,54 +310,52 @@ class AgentREDQ:
             num_q_evals
         )
 
-        t2 = time()
+        # Calculate std of td_targets
+        td_targets_std = tf.math.reduce_std(td_targets)
 
-        # Perform critic update
-        critic_loss = self._critic_update(
-            critic_optimizer,
-            states,
-            actions,
-            td_targets
-        )
+        # Calculate critic and policy loss with autodiff enabled
+        with tf.GradientTape(persistent=True) as tape:
 
-        t3 = time()
+            critic_loss = self._compute_critic_loss(
+                critic_network,
+                states,
+                actions,
+                td_targets
+            )
 
-        # Update target networks
-        self._update_target_network(polyak)
-
-        t4 = time()
-
-        # Perform policy update
-        if self.step % int(self.train_steps_per_env_step // 1) == 0:
-            policy_loss = self._policy_update(
-                policy_optimizer,
+            policy_loss = self._compute_policy_loss(
+                policy_network,
+                critic_network,
                 states,
                 entropy_reg
             )
 
-        else:
-            policy_loss = self.policy_loss
+        # Update critic network
+        critic_grads = tape.gradient(critic_loss, critic_network.trainable_variables)
+        critic_optimizer.apply_gradients(zip(critic_grads, critic_network.trainable_variables))
 
-        self.step += 1
+        pred = tf.equal(update_policy, True)
 
-        """
-        print(t1-t0)
-        print(t2-t1)
-        print(t3-t2)
-        print(t4-t3)
-        print(t5-t4)
-        print()
-        """
+        def true_fn():
+            policy_grads = tape.gradient(policy_loss, policy_network.trainable_variables)
+            policy_optimizer.apply_gradients(zip(policy_grads, policy_network.trainable_variables))
+        def false_fn():
+            pass
 
-        return critic_loss, policy_loss
+        # Update policy network if ready
+        tf.cond(pred, true_fn, false_fn)
 
+        # Update target network
+        self._update_target_network(target_network, critic_network, polyak)
+
+        return critic_loss, policy_loss, td_targets_std
 
 
     def train(
             self,
             steps_per_epoch: int = 1000,
             epochs: int = 50,
-            update_after: int = 2000,
+            update_after: int = 4000,
             start_steps: int = 1000,
             train_steps_per_env_step: int = 20,
             ensemble_size: int = 10,
@@ -438,28 +388,42 @@ class AgentREDQ:
         np.random.seed(seed=42)
         tf.random.set_seed(seed=42)
 
-        tf.keras.mixed_precision.set_global_policy('mixed_float16')
+        # Initialise policy network
+        policy_network = self.policy_network
 
         # Initialise critic ensemble network
-        self.critic_network = self._init_ensemble(self.q_network, ensemble_size)
+        #critic_network = self._init_ensemble(self.q_network, ensemble_size)
+
+        state_input = Input(shape=(11))
+        action_input = Input(shape=(3))
+
+        from keras.layers import Dense, Concatenate
+
+        input = Concatenate()([state_input, action_input])
+
+        hidden_units = 256
+
+        x_layers = [Dense(units=hidden_units, activation="relu")(input) for _ in range(ensemble_size)]
+        y_layers = [Dense(units=hidden_units, activation="relu")(x) for x in x_layers]
+
+        q_values = [Dense(units=1)(y) for y in y_layers]
+
+        critic_network = Model(inputs=[state_input, action_input], outputs=q_values)
+
+        critic_network.summary()
 
         # Initialise target ensemble network
-        self.target_network = clone_model(self.critic_network)
+        target_network = clone_model(critic_network)
 
-        self.ensemble_size = ensemble_size
-
-        self.step = 0
-        self.train_steps_per_env_step = train_steps_per_env_step
-
-        self.policy_loss = tf.convert_to_tensor(0, dtype=tf.float32)
-        self.critic_loss = tf.convert_to_tensor(0, dtype=tf.float32)        
+        for layer in target_network.layers:
+            layer.trainable = False
 
         # Initialise replay buffer
         self.replay_buffer = ReplayBuffer(replay_size)
 
         # Intialise optimizers (same learning_rate)
-        critic_optimizer = optimizer(learning_rate)
         policy_optimizer = optimizer(learning_rate)
+        critic_optimizer = optimizer(learning_rate)
 
         # Set initial max return seen so far to 0
         max_return = 0.0
@@ -484,24 +448,36 @@ class AgentREDQ:
 
         # !!! TRAINING PHASE !!!
 
+        update_policy = False
+        sample = [None] * 5
+        self.replay_buffer._sample(sample, batch_size)
+        states, actions, rewards, new_states, done_flags = sample
+
         tf.summary.trace_on(graph=True, profiler=True)
         # Call only one tf.function when tracing.
         self._training_step(
-            batch_size,
+            update_policy,
+            policy_network,
+            critic_network,
+            target_network,
+            policy_optimizer,
             critic_optimizer,
-            policy_optimizer,  
+            states,
+            actions,
+            rewards,
+            new_states,
+            done_flags,
             discount_factor,
             entropy_reg,
             polyak,
             num_q_evals
-        )        
+        )     
         with summary_writer.as_default():
             tf.summary.trace_export(
                 name="my_func_trace",
                 step=0,
                 profiler_outdir=log_dir
             )
-
 
         print()
         print(f"Training Phase  -  Training Model {current_time}")
@@ -511,33 +487,54 @@ class AgentREDQ:
             t = trange(steps_per_epoch)
             t.set_description_str(f"Epoch {epoch+1}/{epochs}")
             for i in t:
-                total_steps = epoch * steps_per_epoch + i
+                env_steps = epoch * steps_per_epoch + i
 
                 # Mid-training environment transition steps
-                self._train_env_step(total_steps, start_steps)
+                self._train_env_step(policy_network, env_steps, start_steps)
 
                 # Perform network updates
-                for _ in range(train_steps_per_env_step):
+                for update_step in range(train_steps_per_env_step):
 
-                    critic_loss, policy_loss = self._training_step(
-                        batch_size,
-                        critic_optimizer,
+                    # Perform sampling from buffer (on child thread)
+                    new_sample = [None] * 5
+                    child_thread = Thread(target=self.replay_buffer._sample, args=(new_sample, batch_size))
+                    child_thread.start()
+
+                    # Determine whether to update the policy network
+                    update_policy = bool(update_step == train_steps_per_env_step-1)
+
+                    # Perform training step (on main thread)
+                    critic_loss, policy_loss, td_targets_std = self._training_step(
+                        update_policy,
+                        policy_network,
+                        critic_network,
+                        target_network,
                         policy_optimizer,
+                        critic_optimizer,
+                        states,
+                        actions,
+                        rewards,
+                        new_states,
+                        done_flags,
                         discount_factor,
                         entropy_reg,
                         polyak,
                         num_q_evals
-                    )
+                    )     
 
-                    self.critic_loss = critic_loss
-                    self.policy_loss = policy_loss      
-                        
-                    t.set_postfix(critic_loss=self.critic_loss.numpy(), policy_loss=self.policy_loss.numpy())
+                    child_thread.join()
+                    sample = new_sample
+
+                    self.critic_loss_instance._update(critic_loss.numpy())
+                    self.policy_loss_instance._update(policy_loss.numpy())
+                    self.td_targets_std_instance._update(td_targets_std.numpy())
+
+                    t.set_postfix(critic_loss=critic_loss.numpy(), policy_loss=policy_loss.numpy())
 
                 with summary_writer.as_default():
-                    tf.summary.scalar("critic_loss", self.critic_loss, step=total_steps)
-                    tf.summary.scalar("policy_loss", self.policy_loss, step=total_steps)
-                    tf.summary.scalar("td_std", self.td_targets_std_instance._get_running_average(), step=total_steps)
+                    tf.summary.scalar("critic_loss", self.critic_loss_instance._get_running_average(), step=env_steps)
+                    tf.summary.scalar("policy_loss", self.policy_loss_instance._get_running_average(), step=env_steps)
+                    tf.summary.scalar("td_std", self.td_targets_std_instance._get_running_average(), step=env_steps)
 
 
             # Print end of epoch metrics
@@ -549,8 +546,8 @@ class AgentREDQ:
                 print(f"mean_return={new_return}  -  improved from {max_return}  -  agent saved to {log_dir}\n")
                 max_return = new_return
 
-                save_model(self.policy_network, filepath=f"{log_dir}/agent/policy_network", include_optimizer=False)
-                save_model(self.critic_network, filepath=f"{log_dir}/agent/critic_network", include_optimizer=False)
+                save_model(policy_network, filepath=f"{log_dir}/agent/policy_network", include_optimizer=False)
+                save_model(critic_network, filepath=f"{log_dir}/agent/critic_network", include_optimizer=False)
             else:
                 print(f"mean_return={new_return}  -  no improvement\n")
 

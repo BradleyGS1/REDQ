@@ -5,11 +5,11 @@ import tensorflow as tf
 
 class ReplayBuffer:
     def __init__(self, replay_size: int):
-        self.states_buffer = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True, clear_after_read=False)
-        self.actions_buffer = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True, clear_after_read=False)
-        self.rewards_buffer = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True, clear_after_read=False)
-        self.new_states_buffer = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True, clear_after_read=False)
-        self.done_flags_buffer = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True, clear_after_read=False)
+        self.states_buffer = tf.TensorArray(dtype=tf.float32, size=replay_size, clear_after_read=False)
+        self.actions_buffer = tf.TensorArray(dtype=tf.float32, size=replay_size, clear_after_read=False)
+        self.rewards_buffer = tf.TensorArray(dtype=tf.float32, size=replay_size, clear_after_read=False)
+        self.new_states_buffer = tf.TensorArray(dtype=tf.float32, size=replay_size, clear_after_read=False)
+        self.done_flags_buffer = tf.TensorArray(dtype=tf.float32, size=replay_size, clear_after_read=False)
 
         self.buffers = [
             self.states_buffer,
@@ -31,16 +31,8 @@ class ReplayBuffer:
         self.size = min(self.size + 1, self.replay_size)
         self.index = (self.index + 1) % self.replay_size
 
-    @tf.function
-    def _sample(self, batch_size: int):
-        sample_indices = tf.random.categorical(tf.zeros(shape=(batch_size, self.size), dtype=tf.float32), num_samples=1, dtype=tf.int32)
-
-        states = tf.squeeze(tf.gather(self.states_buffer.stack(), sample_indices, axis=0, batch_dims=True))
-        actions = tf.squeeze(tf.gather(self.actions_buffer.stack(), sample_indices, axis=0, batch_dims=True))
-        rewards = tf.squeeze(tf.gather(self.rewards_buffer.stack(), sample_indices, axis=0, batch_dims=True))
-        new_states = tf.squeeze(tf.gather(self.new_states_buffer.stack(), sample_indices, axis=0, batch_dims=True))
-        done_flags = tf.squeeze(tf.gather(self.done_flags_buffer.stack(), sample_indices, axis=0, batch_dims=True))
-
-        sample = (states, actions, rewards, new_states, done_flags)
-
-        return sample
+    # Edits sample in place
+    def _sample(self, sample: list, batch_size: int):
+        sample_indices = tf.convert_to_tensor(np.random.choice(self.size, size=batch_size), dtype=tf.int32)
+        for i in range(5):
+            sample[i] = tf.squeeze(self.buffers[i].gather(sample_indices))
