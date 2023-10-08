@@ -34,9 +34,9 @@ class AgentREDQ:
         self.entropy_instance = RunningAverage(sample_size=20)
 
         self.critic_loss_instance = RunningAverage(sample_size=100)
-        self.policy_loss_instance = RunningAverage(sample_size=20)
+        self.policy_loss_instance = RunningAverage(sample_size=100)
 
-        self.mean_return_instance = RunningAverage(sample_size=3)
+        self.mean_return_instance = RunningAverage(sample_size=5)
 
 
     # Function to create Q function ensemble network
@@ -49,9 +49,9 @@ class AgentREDQ:
 
         backbone_layers = [clone_model(Model(inputs=q_network.layers[3].input, outputs=q_network.layers[-1].output)) for _ in range(ensemble_size)]
 
-        backbone_layers = [backbone_layer(join) for backbone_layer in backbone_layers]
+        backbone_outputs = [backbone_layer(join) for backbone_layer in backbone_layers]
 
-        ensemble_network = Model(inputs=[state_input, action_input], outputs=backbone_layers)
+        ensemble_network = Model(inputs=[state_input, action_input], outputs=backbone_outputs)
 
         return ensemble_network
 
@@ -127,7 +127,7 @@ class AgentREDQ:
         # We squash these values into the range (-1, 1) via tanh
         action_values = tf.math.tanh(sample_values)
 
-        # Compute the log-likelihoods of these squashed actions
+        # Compute the log probs of these squashed actions
         action_log_probs = (
             log_probs
             -
@@ -169,7 +169,7 @@ class AgentREDQ:
 
     # Function to calculate the mean return evaluation metric of current agent
 
-    def mean_return(self, eval_episodes: int):
+    def mean_return(self, policy_network: tf.keras.models.Model, eval_episodes: int):
         # Get initial state and function to perform environment update
         self._init_environment()
 
@@ -181,7 +181,7 @@ class AgentREDQ:
             # Loop over transitions
             while not done:
                 # Get most likely action from the stochastic policy
-                action = tf.math.tanh(self.policy_network(self.state)[0])
+                action = tf.math.tanh(policy_network(self.state)[0])
 
                 # Perform action and get reward
                 self.state, reward, done = self.tf_env_step(action)
@@ -388,7 +388,6 @@ class AgentREDQ:
             epochs: int = 50,
             update_after: int = 4000,
             start_steps: int = 1000,
-            update_every: int = 200,
             train_steps_per_env_step: int = 20,
             ensemble_size: int = 10,
             num_q_evals: int = 2,
@@ -399,7 +398,7 @@ class AgentREDQ:
             learning_rate: float = 1e-4,
             reward_scale: float = 0.01,
             discount_factor: float = 0.99,
-            entropy_reg: float = 0.20,
+            entropy_reg: float = 0.2,
             polyak: float = 0.995,
             log_warnings: bool = False):
         
@@ -442,12 +441,9 @@ class AgentREDQ:
 
         # Set initial max return seen so far to 0
         max_return = 0.0
+        new_return = self.mean_return(policy_network, eval_episodes)
+        self.mean_return_instance._update(new_return)
 
-        log_steps = 0
-
-        mean_return = self.mean_return(eval_episodes)
-        with summary_writer.as_default():
-            tf.summary.scalar("mean_return", mean_return, step=0)
 
 
 
@@ -492,71 +488,66 @@ class AgentREDQ:
         print()
         print(f"Training Phase  -  Training Model {current_time}")
         sleep(0.5)
+        env_steps = 0
         for epoch in range(epochs):
             # Loop over transition steps in epoch
             t = trange(steps_per_epoch)
             t.set_description_str(f"Epoch {epoch+1}/{epochs}")
-            for i in t:
-                env_steps = epoch * steps_per_epoch + i
-
+            for _ in t:
                 # Mid-training environment transition steps
                 entropy = self._train_env_step(policy_network, env_steps, start_steps)
                 self.entropy_instance._update(entropy.numpy())
-                tf.summary.scalar("entropy", self.entropy_instance._get_running_average(), step=env_steps)
 
-                # Every update_every steps we perform the training steps
-                if env_steps % update_every == update_every-1:
+                # Perform network updates
+                for update_step in range(train_steps_per_env_step):
 
-                    # Perform network updates
-                    for update_step in range(train_steps_per_env_step * update_every):
+                    # Perform sampling from buffer (on child thread)
+                    new_sample = [None] * 5
+                    child_thread = Thread(target=self.replay_buffer._sample, args=(new_sample, batch_size))
+                    child_thread.start()
 
-                        # Perform sampling from buffer (on child thread)
-                        new_sample = [None] * 5
-                        child_thread = Thread(target=self.replay_buffer._sample, args=(new_sample, batch_size))
-                        child_thread.start()
+                    # Determine whether to update the policy network
+                    update_policy = bool(update_step == train_steps_per_env_step-1)
 
-                        # Determine whether to update the policy network
-                        update_policy = bool(update_step % train_steps_per_env_step == train_steps_per_env_step-1)
+                    # Perform training step (on main thread)
+                    critic_loss, policy_loss, td_targets_std = self._training_step(
+                        update_policy,
+                        policy_network,
+                        critic_network,
+                        target_network,
+                        policy_optimizer,
+                        critic_optimizer,
+                        sample,
+                        discount_factor,
+                        entropy_reg,
+                        num_q_evals
+                    )     
 
-                        # Perform training step (on main thread)
-                        critic_loss, policy_loss, td_targets_std = self._training_step(
-                            update_policy,
-                            policy_network,
-                            critic_network,
-                            target_network,
-                            policy_optimizer,
-                            critic_optimizer,
-                            sample,
-                            discount_factor,
-                            entropy_reg,
-                            num_q_evals
-                        )     
+                    # Update target network
+                    self._update_target_network(target_network, critic_network, polyak)
 
-                        # Update target network
-                        self._update_target_network(target_network, critic_network, polyak)
+                    child_thread.join()
+                    sample = new_sample
 
-                        child_thread.join()
-                        sample = new_sample
+                    self.critic_loss_instance._update(critic_loss.numpy())
+                    self.policy_loss_instance._update(policy_loss.numpy())
+                    self.td_targets_std_instance._update(td_targets_std.numpy())
 
-                        self.critic_loss_instance._update(critic_loss.numpy())
-                        self.policy_loss_instance._update(policy_loss.numpy())
-                        self.td_targets_std_instance._update(td_targets_std.numpy())
-
-                        t.set_postfix(critic_loss=f"{critic_loss.numpy():.3f}", policy_loss=f"{policy_loss.numpy():.3f}")
-
-                        if update_policy:
-                            with summary_writer.as_default():
-                                tf.summary.scalar("critic_loss", self.critic_loss_instance._get_running_average(), step=log_steps)
-                                tf.summary.scalar("policy_loss", self.policy_loss_instance._get_running_average(), step=log_steps)
-                                tf.summary.scalar("td_std", self.td_targets_std_instance._get_running_average(), step=log_steps)
-                            
-                            log_steps += 1
+                    t.set_postfix(critic_loss=f"{critic_loss.numpy():.3f}", policy_loss=f"{policy_loss.numpy():.3f}")
+                
+                if env_steps % int(steps_per_epoch // 10) == 0:
+                    new_return = self.mean_return(policy_network, eval_episodes)
+                    self.mean_return_instance._update(new_return)
 
 
-            # Print end of epoch metrics
-            new_return = self.mean_return(eval_episodes)
-            with summary_writer.as_default():
-                tf.summary.scalar("mean_return", new_return, step=epoch+1)
+                with summary_writer.as_default():
+                    tf.summary.scalar("critic_loss", self.critic_loss_instance._get_running_average(), step=env_steps)
+                    tf.summary.scalar("policy_loss", self.policy_loss_instance._get_running_average(), step=env_steps)
+                    tf.summary.scalar("td_std", self.td_targets_std_instance._get_running_average(), step=env_steps)
+                    tf.summary.scalar("entropy", self.entropy_instance._get_running_average(), step=env_steps)
+                    tf.summary.scalar("episode_return", self.mean_return_instance._get_running_average(), step=env_steps)
+
+                env_steps += 1
 
             if new_return > max_return:
                 print(f"mean_return={new_return}  -  improved from {max_return}  -  agent saved to {log_dir}\n")
