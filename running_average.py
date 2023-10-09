@@ -1,5 +1,4 @@
 import numpy as np
-import tensorflow as tf
 
 # Create running average metric class
 # Used for keeping track of any mid-training metric via a running average
@@ -17,10 +16,12 @@ class RunningAverage:
         self.size = min(self.size + 1, self.sample_size)
         self.index = (self.index + 1) % self.sample_size
 
-        self.avg = np.sum(self.sample) / self.size
-
-    def _get_running_average(self):
-        if self.size != self.sample_size:
-            return np.median(self.sample[np.abs(self.sample) > 1e-6]) + self.non_zero * 1e-6
-        else:
-            return self.avg + self.non_zero * 1e-6
+    def _get_running_average(self, type: str = "mean"):
+        if type == "mean":
+            if self.size != self.sample_size:
+                return np.median(self.sample[np.abs(self.sample) > 1e-6]) + self.non_zero * 1e-6
+            else:
+                return np.mean(self.sample) + self.non_zero * 1e-6
+            
+        elif type == "std":
+            return np.std(self.sample[np.abs(self.sample) > 1e-6])

@@ -1,4 +1,4 @@
-# Randomised Ensemble Double Q-function (REDQ) with Soft Actor-Critic (SAC)
+# Randomised Ensemble Double Q-learning (REDQ) with Soft Actor-Critic (SAC)
 
 ## Overview
 

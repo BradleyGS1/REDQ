@@ -1,0 +1,42 @@
+Wed Oct  4 17:10:02 2023
+WARNING: Unknown warning type Time = 0.1120.
+
+Wed Oct  4 17:10:22 2023
+WARNING: Unknown warning type Time = 0.0000.
+
+Wed Oct  4 17:14:36 2023
+WARNING: Unknown warning type Time = 0.0000.
+
+Wed Oct  4 17:18:51 2023
+WARNING: Unknown warning type Time = 0.0000.
+
+Wed Oct  4 17:23:07 2023
+WARNING: Unknown warning type Time = 0.0000.
+
+Wed Oct  4 17:27:22 2023
+WARNING: Unknown warning type Time = 0.0000.
+
+Wed Oct  4 17:39:13 2023
+WARNING: Unknown warning type Time = 0.0640.
+
+Wed Oct  4 17:39:20 2023
+WARNING: Unknown warning type Time = 0.0000.
+
+Wed Oct  4 19:55:21 2023
+WARNING: Unknown warning type Time = 0.0080.
+
+Wed Oct  4 19:56:05 2023
+WARNING: Unknown warning type Time = 0.0000.
+
+Wed Oct  4 20:00:12 2023
+WARNING: Unknown warning type Time = 0.0000.
+
+Wed Oct  4 20:04:22 2023
+WARNING: Unknown warning type Time = 0.0000.
+
+Wed Oct  4 23:53:46 2023
+WARNING: Unknown warning type Time = 0.1360.
+
+Wed Oct  4 23:53:52 2023
+WARNING: Unknown warning type Time = 0.0000.
+

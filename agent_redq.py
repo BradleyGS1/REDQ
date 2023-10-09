@@ -5,29 +5,27 @@ import tensorflow_probability as tfp
 import gymnasium as gym
 
 from threading import Thread
-from time import time, sleep
+from time import sleep
 from tqdm import trange
-from keras.layers import Input
+from keras.layers import Input, Dense, Concatenate
 from keras.models import Model, _clone_layer, clone_model, save_model
 from keras.optimizers import Adam
 
-from replay_buffer import ReplayBuffer
+from ensemble_utils_layers import EnsembleDenseLayer, EnsembleSplitLayer, EnsembleOutputLayer
+from replay_buffer import ReplayBufferUniform, ReplayBufferPrioritised
 from running_average import RunningAverage
 
 # Create Single Agent Randomised Ensemble Double Q-learning
 
 class AgentREDQ:
-    def __init__(
-            self,
-            policy_network: tf.keras.models.Model,
-            q_network: tf.keras.models.Model,
-            env: gym.Env):
-        
-        self.policy_network = policy_network
-        self.q_network = q_network
+    def __init__(self):
+        self.policy_network = None
+        self.critic_network = None
 
-        self.env = env
-        self._init_environment()
+        self.env = None
+        self.state = None
+
+        self.replay_buffer = None
 
         # Initialise the running averages
         self.td_targets_std_instance = RunningAverage(sample_size=100, non_zero=True)
@@ -37,23 +35,6 @@ class AgentREDQ:
         self.policy_loss_instance = RunningAverage(sample_size=100)
 
         self.mean_return_instance = RunningAverage(sample_size=5)
-
-
-    # Function to create Q function ensemble network
-
-    def _init_ensemble(self, q_network: tf.keras.models.Model, ensemble_size: int):
-        state_input = Input(q_network.layers[0].input_shape[0][1])
-        action_input = Input(q_network.layers[1].input_shape[0][1])
-
-        join = _clone_layer(q_network.layers[2])([state_input, action_input])
-
-        backbone_layers = [clone_model(Model(inputs=q_network.layers[3].input, outputs=q_network.layers[-1].output)) for _ in range(ensemble_size)]
-
-        backbone_outputs = [backbone_layer(join) for backbone_layer in backbone_layers]
-
-        ensemble_network = Model(inputs=[state_input, action_input], outputs=backbone_outputs)
-
-        return ensemble_network
 
 
     # Function to reset the environment and get the initial state
@@ -67,7 +48,7 @@ class AgentREDQ:
 
     # Function to initialise the environment with a tensorflow compatible step function
 
-    def _init_environment(self):
+    def _init_environment(self, env):
         self._reset_environment()
         state_dim = self.env.observation_space.shape[0]
 
@@ -85,6 +66,7 @@ class AgentREDQ:
             
             return state, reward, done
         
+        self.env = env
         self.tf_env_step = tf_env_step
     
 
@@ -171,7 +153,7 @@ class AgentREDQ:
 
     def mean_return(self, policy_network: tf.keras.models.Model, eval_episodes: int):
         # Get initial state and function to perform environment update
-        self._init_environment()
+        self._init_environment(self.env)
 
         episode_returns = []
         for _ in range(eval_episodes):
@@ -213,19 +195,15 @@ class AgentREDQ:
 
         # Get the tensor of Q values from the target network ensemble
         # Shape: (None, ensemble_size)
-        q_values = tf.concat(target_network([new_states, new_actions]), axis=-1)
+        q_indices = tf.random.shuffle(tf.range(self.ensemble_size))[:num_q_evals]
+        q_mask = tf.zeros(shape=(self.ensemble_size,), dtype=tf.float32)
+        # Use scatter_update to set the elements at the given indices to 1
+        q_mask = tf.tensor_scatter_nd_update(q_mask, tf.expand_dims(q_indices, axis=1), tf.ones_like(q_indices, dtype=tf.float32))
 
-        # Sample num_q_evals values from each of the batch entries, the respective critic networks
-        # associated with these sampled values are constant throughout the batch
-        #q_indices = tf.repeat(tf.expand_dims(tf.range(q_values.shape[-1]), axis=0), repeats=q_values.shape[0], axis=0)
-        def fn(ensemble_size):
-            return tf.random.shuffle(tf.range(ensemble_size))[:num_q_evals]        
-
-        q_indices = tf.map_fn(fn, elems=tf.fill(dims=(q_values.shape[0],), value=q_values.shape[-1]))  
-        q_values_subset = tf.gather(q_values, q_indices, axis=-1, batch_dims=True)
+        q_values = tf.concat(target_network([new_states, new_actions, q_mask]), axis=-1)
 
         # Get the minimum Q values from the randomly chosen subset of Q functions in the ensemble
-        min_q_values = tf.math.reduce_min(q_values_subset, axis=-1)
+        min_q_values = tf.math.reduce_min(q_values, axis=-1)
 
         # Calculate temporal difference targets
         td_targets = rewards + discount_factor * (1 - done_flags) * (min_q_values - entropy_reg * new_action_log_probs)
@@ -267,7 +245,8 @@ class AgentREDQ:
         # Note: sampling is differentiable thanks to the reparameterisation trick
         actions, action_log_probs = self._sample_action(policy_network, states)
 
-        q_values = tf.concat(critic_network([states, actions]), axis=-1)
+        q_mask = tf.ones(shape=self.ensemble_size, dtype=tf.float32)
+        q_values = tf.concat(critic_network([states, actions, q_mask]), axis=-1)
 
         # Get the mean Q values along the ensemble of Q functions to get a better approximator
         #min_q_values = tf.math.reduce_min(q_values, axis=-1)
@@ -336,10 +315,11 @@ class AgentREDQ:
         with tf.GradientTape(persistent=True) as tape:
 
             # Calculate the q values from all critic networks
-            q_values = tf.concat(critic_network([states, actions]), axis=-1)
+            q_mask = tf.ones(self.ensemble_size, dtype=tf.float32)
+            q_values = tf.concat(critic_network([states, actions, q_mask]), axis=-1)
 
             # Update the individual critic networks 
-            while critic_index < q_values.shape[-1]:
+            while critic_index < self.ensemble_size:
 
                 critic_loss = self._compute_critic_loss(
                     critic_index,
@@ -382,18 +362,92 @@ class AgentREDQ:
         return critic_loss, policy_loss, td_targets_std
 
 
+    def networks(
+            self,
+            state_dim: int,
+            action_dim: int,
+            policy_network_hidden_units: list = [256, 256],
+            critic_network_hidden_units: list = [256, 256],
+            ensemble_size: int = 5,
+            display_summaries: bool = False):
+                
+
+        self.ensemble_size = ensemble_size
+
+        # Initialise policy network
+        state_input = Input(shape=(state_dim))
+        x = state_input
+
+        for hidden_units in policy_network_hidden_units:
+            x = Dense(units=hidden_units, activation="relu")(x)
+
+        means = Dense(units=action_dim)(x)
+        stddevs = Dense(units=action_dim, activation="softplus")(x)
+
+        self.policy_network = Model(inputs=[state_input], outputs=[means, stddevs])
+        
+        # Initialise critic ensemble network
+        state_input = tf.keras.layers.Input(shape=(state_dim))
+        action_input = tf.keras.layers.Input(shape=(action_dim))
+        mask_input = tf.keras.layers.Input(shape=(ensemble_size))
+
+        data_input = tf.keras.layers.Concatenate()([state_input, action_input])
+        mask_input_split = EnsembleSplitLayer()(mask_input)
+
+        x = [EnsembleDenseLayer(critic_network_hidden_units[0], activation="relu")([data_input, mask_input_split[i]]) for i in range(ensemble_size)]
+        for hidden_units in critic_network_hidden_units[1:]:
+            x = [EnsembleDenseLayer(hidden_units, activation="relu")(x[i]) for i in range(ensemble_size)]
+        x = [EnsembleDenseLayer(1)(x[i]) for i in range(ensemble_size)]
+
+        outputs = [EnsembleOutputLayer()(x[i]) for i in range(ensemble_size)]
+
+        self.critic_network = tf.keras.models.Model(inputs=[state_input, action_input, mask_input], outputs=outputs)
+
+        if display_summaries:
+            self.policy_network.summary()
+            self.critic_network.summary()
+
+        return self
+
+
+    def buffer(
+            self,
+            buffer_type: str = "uniform",
+            replay_size: int = 10 ** 5,
+            prioritised_replay_size: int = None):
+    
+
+        if buffer_type == "uniform":
+            self.replay_buffer = ReplayBufferUniform(replay_size)
+
+        elif buffer_type == "prioritised":
+            if prioritised_replay_size != None and prioritised_replay_size < replay_size:
+                self.replay_buffer = ReplayBufferPrioritised(replay_size, prioritised_replay_size)
+            else:
+                print("Missing required argument. If buffer_type='prioritised' then must have prioritised_replay_size << replay_size.")
+        
+        else:
+            print("Invalid argument value. buffer_type must be the string 'uniform' or 'prioritised'.")
+
+        return self
+
+
+    def environment(self, env: gym.Env):
+        self._init_environment(env)
+
+        return self
+
+
     def train(
             self,
             steps_per_epoch: int = 4000,
-            epochs: int = 50,
+            epochs: int = 20,
             update_after: int = 4000,
-            start_steps: int = 1000,
-            train_steps_per_env_step: int = 20,
-            ensemble_size: int = 10,
+            start_steps: int = 0,
+            train_steps_per_env_step: int = 10,
             num_q_evals: int = 2,
             eval_episodes: int = 1,
             batch_size: int = 256,
-            replay_size: int = 10 ** 6,
             optimizer: tf.keras.optimizers.Optimizer = Adam,
             learning_rate: float = 1e-4,
             reward_scale: float = 0.01,
@@ -406,6 +460,21 @@ class AgentREDQ:
 
         
         # !!! INIT PHASE !!!
+
+        # Check that all necessary components for training have been initialised
+        init_error = False
+        if self.policy_network is None:
+            print("Policy and/or critic network not initialised. Please use method 'network' to initialise")
+            init_error = True
+        elif self.replay_buffer is None:
+            print("Replay buffer not initialised. Please use method 'buffer' to initialise")
+            init_error = True
+        elif self.env is None:
+            print("Environment not initialised. Please use method 'environment' to initialise")
+            init_error = True        
+
+        if init_error:
+            return
 
         # Set tensorflow logger to ignore warnings by default
         if not log_warnings:
@@ -420,22 +489,14 @@ class AgentREDQ:
         np.random.seed(seed=42)
         tf.random.set_seed(seed=42)
 
-        # Initialise policy network
-        policy_network = clone_model(self.policy_network)
-
-        # Initialise critic ensemble network
-        critic_network = self._init_ensemble(self.q_network, ensemble_size)
-
-        target_network = clone_model(critic_network)
-        for layer in target_network.layers:
-            layer.trainable = False
-
-        # Initialise replay buffer
-        self.replay_buffer = ReplayBuffer(replay_size)
-
-        # Intialise optimizers
+        # Initialise optimizers
         policy_optimizer = optimizer(learning_rate)
         critic_optimizer = optimizer(learning_rate)
+
+        # Initialise networks
+        policy_network = self.policy_network
+        critic_network = self.critic_network
+        target_network = clone_model(critic_network)
 
         self.reward_scale = reward_scale
 
